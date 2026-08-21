@@ -1,0 +1,13 @@
+# 编译产物（发布页提供预编译二进制）
+pikpak-proxy-*
+pikpak-proxy
+pikpak-proxy.exe
+*.exe
+
+# 运行时数据
+cache/
+*.log
+
+# Go
+*.test
+*.out
