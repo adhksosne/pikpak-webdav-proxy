@@ -56,10 +56,10 @@ type fileCacheEntry struct {
 	at   time.Time
 }
 
-func New(dav *davclient.Client, cacheDir string, authUser, authPass string) *Server {
+func New(dav *davclient.Client, cacheDir string, authUser, authPass string, concurrency int) *Server {
 	s := &Server{
 		dav:       dav,
-		stream:    NewStreamer(dav, cacheDir),
+		stream:    NewStreamer(dav, cacheDir, concurrency),
 		authUser:  authUser,
 		authPass:  authPass,
 		dirCache:  make(map[string]*dirCacheEntry),
@@ -297,15 +297,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, path string) 
 	size, err := s.getFileSize(path)
 	if err != nil {
 		log.Printf("get file size err: %v", err)
-		http.Error(w, "size lookup: "+err.Error(), 502)
-		return
-	}
-
-	if r.Method == "HEAD" {
-		w.Header().Set("Content-Type", "binary/octet-stream")
-		w.Header().Set("Accept-Ranges", "bytes")
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
-		w.WriteHeader(http.StatusOK)
+		s.writeUpstreamErr(w, err)
 		return
 	}
 
@@ -313,6 +305,21 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, path string) 
 	if err := s.stream.ServeFile(w, r, path, size); err != nil {
 		log.Printf("stream err: %v", err)
 	}
+}
+
+// writeUpstreamErr 上游错误分类响应：网关熔断返回 503 + Retry-After
+// （播放器语义化稍后重试），其余错误维持 502。
+func (s *Server) writeUpstreamErr(w http.ResponseWriter, err error) {
+	if strings.Contains(err.Error(), "rate-limited") {
+		retry := 30
+		if d := s.dav.CooldownRemaining(); d > 0 {
+			retry = int(d.Seconds()) + 1
+		}
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", retry))
+		http.Error(w, "gateway rate-limited, retry later", http.StatusServiceUnavailable)
+		return
+	}
+	http.Error(w, "size lookup: "+err.Error(), http.StatusBadGateway)
 }
 
 // getFileSize 拿文件大小：优先元数据缓存（PROPFIND 时已存，免 302 网络往返），

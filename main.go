@@ -1,7 +1,9 @@
 // pikpak-webdav-proxy — PikPak WebDAV 加速代理
 //
 // 解决中国大陆 PikPak 用户直连 WebDAV 下载慢、播放器拖动卡顿的痛点：
-// 1. CDN 直链缓存（一次 302，~80 分钟反复用）+ 节点择优（低速时后台换节点）
+// 1. CDN 直链缓存（一次 302，~80 分钟反复用）+ DNS 节点枚举优选
+//    （签名 query 只绑文件不绑节点：枚举 dl-z01a-XXXX 兄弟域名 → DNS 探活
+//    → 两阶段测速 → 全局锁定最快节点，全程零网关请求，免疫 302 熔断）
 // 2. 64KB 首段快速出画 + 滑动窗口调度（带宽锚定播放位置）
 // 3. HTTP/1.1 持久连接池（TTFB≈0）
 // 4. 三级缓存（内存按块 / 磁盘可选 / 网络兜底）+ Prewarm 预热
@@ -28,7 +30,7 @@ import (
 )
 
 // version 版本号（发版时更新）
-const version = "1.0"
+const version = "1.1"
 
 func main() {
 	listen := flag.String("listen", ":7777", "本地监听地址")
@@ -37,7 +39,7 @@ func main() {
 	pass := flag.String("pass", "", "PikPak WebDAV 密码")
 	authUser := flag.String("auth-user", "", "代理认证用户名，留空则匿名模式")
 	authPass := flag.String("auth-pass", "", "代理认证密码，留空则匿名模式")
-	c := flag.Int("c", 8, "单文件并行连接数")
+	c := flag.Int("c", 16, "单文件并行连接数（1-32，默认 16；CD2 实测甜点值，32 无增益且有网关错误风险）")
 	cacheDir := flag.String("cachedir", "", "磁盘缓存目录，留空关闭（默认关，仅内存缓存）")
 	dns := flag.String("dns", "", "兜底 DNS 服务器（逗号分隔，如 223.5.5.5），仅系统 DNS 不可用时使用")
 	verbose := flag.Bool("v", false, "打印详细请求日志")
@@ -73,7 +75,7 @@ func main() {
 	}
 
 	dav := davclient.New(*target, *user, *pass, *c, dnsServers)
-	srv := server.New(dav, *cacheDir, *authUser, *authPass)
+	srv := server.New(dav, *cacheDir, *authUser, *authPass, *c)
 	davclient.Verbose = *verbose
 	server.Verbose = *verbose
 
@@ -84,6 +86,7 @@ func main() {
 	log.Printf("  认证     : %s", authMode)
 	log.Printf("  磁盘缓存 : %s", cacheMode)
 	log.Printf("  DNS      : %s [%s]", dnsMode, dav.DNSNote())
+	log.Printf("  证书     : %s", dav.CertNote())
 	if *verbose {
 		log.Printf("  详细日志 : 开启（-v）")
 	}

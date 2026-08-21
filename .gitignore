@@ -8,6 +8,12 @@ pikpak-proxy.exe
 cache/
 *.log
 
+# 调查/诊断临时产物（逆向分析中间文件，勿入库）
+.ida-mcp/
+urls.txt
+scaninfo.txt
+body_200.bin
+
 # Go
 *.test
 *.out

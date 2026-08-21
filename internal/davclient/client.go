@@ -1,4 +1,4 @@
-﻿package davclient
+package davclient
 
 import (
 	"encoding/xml"
@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,12 +25,34 @@ type Client struct {
 	signedMu sync.Mutex
 	signed   map[string]*SignedURL
 
+	// 网关限流熔断：空 200 时标记账号级冷却截止时间（unix nano，atomic）。
+	// 冷却期内所有新签名请求直接拒绝——否则每个请求独立重试 5 次，
+	// 每次重试又是新 302 请求，反过来加重限流（重试风暴，实测踩过）。
+	cooldown int64
+
 	dns *smartDNS // DNS 来源说明（Note）
+	certNote string // 根证书来源说明（启动横幅用）
+}
+
+// CertNote 返回根证书来源说明（启动横幅用）。
+func (c *Client) CertNote() string {
+	return c.certNote
 }
 
 // DNSNote 返回 DNS 来源说明（启动横幅用）。
 func (c *Client) DNSNote() string {
 	return c.dns.note
+}
+
+// CooldownRemaining 返回网关限流冷却剩余时长（0 = 未限流）。
+// 预热等低优先级后台任务据此让路，限流期间不发任何 302 请求。
+func (c *Client) CooldownRemaining() time.Duration {
+	if until := atomic.LoadInt64(&c.cooldown); until > 0 {
+		if d := time.Until(time.Unix(0, until)); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // SignedURL 是从 dav 拿到的 302 Location（指向 dl-*.mypikpak.net 的签名下载 URL）。
@@ -54,6 +77,7 @@ var Verbose bool
 // dnsServers 非空时用指定 DNS 服务器（Termux 等非标准环境友好，详见 smartDNS）。
 func New(baseURL, user, pass string, poolSize int, dnsServers []string) *Client {
 	dns := newSmartDNS(dnsServers)
+	tlsCfg, certNote := loadRootCAs() // Termux/安卓下系统池为空，须内置根证书兜底
 	t := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: poolSize,
@@ -63,6 +87,7 @@ func New(baseURL, user, pass string, poolSize int, dnsServers []string) *Client 
 		DisableCompression:  true, // 视频已压缩，关 gzip
 		ForceAttemptHTTP2:   false, // PikPak 不支持 HTTP/2
 		DialContext:         dns.dialContext(), // Termux/proot 下 Go 读不到 resolv.conf，自定义解析接管
+		TLSClientConfig:     tlsCfg,             // Termux/proot 下 Go 读不到 /etc/ssl，根证书须自备
 	}
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
@@ -76,8 +101,9 @@ func New(baseURL, user, pass string, poolSize int, dnsServers []string) *Client 
 			},
 			Timeout: 0, // 流式下载不设全局超时
 		},
-		signed: make(map[string]*SignedURL),
-		dns:    dns,
+		signed:   make(map[string]*SignedURL),
+		dns:      dns,
+		certNote: certNote,
 	}
 }
 
@@ -122,6 +148,12 @@ func (c *Client) GetSignedURL(path string) (*SignedURL, error) {
 	// 典型场景是同账号的另一个客户端正在预读。总窗口 15 秒扛过常规预读。
 	backoff := []time.Duration{0, 1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
 	for attempt := 0; attempt < 5; attempt++ {
+		// 全局熔断冷却检查：账号已被网关限流（空 200）时停止一切新 302 请求，
+		// 重试只会延长限流窗口。首个撞限流的请求已标记 cooldown。
+		if until := atomic.LoadInt64(&c.cooldown); time.Now().UnixNano() < until {
+			return nil, fmt.Errorf("gateway rate-limited, cooling down until %s",
+				time.Unix(0, until).Format("15:04:05"))
+		}
 		if backoff[attempt] > 0 {
 			c.signedMu.Unlock()
 			time.Sleep(backoff[attempt])
@@ -161,6 +193,12 @@ func (c *Client) fetchSignedOnce(path string) (*SignedURL, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 302 && resp.StatusCode != 301 {
+		// 空 200 = 网关账号级限流信号：标记全局冷却 60s，
+		// 期间所有签名请求秒拒绝（GetSignedURL 开头检查），避免重试风暴
+		if resp.StatusCode == http.StatusOK && resp.ContentLength == 0 {
+			atomic.StoreInt64(&c.cooldown, time.Now().Add(60*time.Second).UnixNano())
+			log.Printf("gateway rate-limited (empty 200), account cooldown 60s")
+		}
 		// 取证：打印 200 降级响应的详情（headers + body 前缀），仅 -v 模式
 		if Verbose {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))

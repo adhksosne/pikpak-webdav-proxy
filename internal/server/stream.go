@@ -1,4 +1,4 @@
-﻿package server
+package server
 
 import (
 	"context"
@@ -18,7 +18,7 @@ import (
 // ParallelStreamer 是核心模块。
 //
 // 调度参数（针对 4K 流媒体播放调优）：
-//   - Concurrency=8        （8 并发对单文件足够）
+//   - Concurrency=16       （-c 参数，默认 16：CD2 交叉实测甜点值）
 //   - BigChunk=2MB          （吞吐主力段）
 //   - MidChunk=1MB
 //   - SmallChunk=512KB     （seek 后首块）
@@ -64,11 +64,21 @@ func (s *SpeedLog) Add(mbPerSec float64) {
 	}
 }
 
-func NewStreamer(dav *davclient.Client, cacheDir string) *ParallelStreamer {
+// NewStreamer 创建流式下载器。concurrency 来自 -c 参数（默认 16）：
+// CD2 交叉实测（2/8/16/32 线程）：16 为甜点值——对比 8 有可见提升，32 相比 16 无增益
+// 且偶发触发网关错误；不限速时段 2 线程即可跑 30+MB/s，16 为限速时段（单连接 2-6MB/s）
+// 的充分对冲。滑动窗口恰为 16 段在飞，与 16 worker 满编咬合。
+func NewStreamer(dav *davclient.Client, cacheDir string, concurrency int) *ParallelStreamer {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > 32 {
+		concurrency = 32
+	}
 	return &ParallelStreamer{
 		dav:         dav,
 		evaluator:   davclient.NewNodeEvaluator(dav),
-		Concurrency: 8,                   // 8 并发对单文件足够
+		Concurrency: concurrency,         // -c 参数控制 worker 数（上限 32）
 		BigChunk:    2 * 1024 * 1024,     // 吞吐主力段
 		MidChunk:    1 * 1024 * 1024,
 		SmallChunk:  512 * 1024,          // seek 后首块
@@ -169,7 +179,9 @@ func pathBase(p string) string {
 // Prewarm 目录浏览后预热：对目录里的视频文件预取签名 URL + 建立到节点的热连接。
 // 播放器显示文件列表到用户点击之间有几秒窗口，利用它把"302 往返 + TCP/TLS 冷启动"
 // 提前做掉——用户点击时首段直接跑热连接，TTFB 只剩传输时间。
-// 串行 + 间隔，避免触发账号级 302 限流；最多预热 3 个文件。
+// Debounce：等浏览静止 2.5s 才开始——连续刷目录时每个新 PROPFIND 取消旧预热
+// 重新计时，连续浏览 = 零预热请求（实测教训：连扫 6 目录 16 秒 22 次网关交互
+// 触发账号熔断，空 200 持续数小时）。串行 + 间隔；最多预热 3 个文件。
 // 真实请求到达时自动让路（stopPrewarm）。
 func (s *ParallelStreamer) Prewarm(entries []davclient.DavEntry) {
 	files := make([]string, 0, 4)
@@ -187,14 +199,26 @@ func (s *ParallelStreamer) Prewarm(entries []davclient.DavEntry) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.prewarmMu.Lock()
 	if s.prewarmCancel != nil {
-		s.prewarmCancel() // 新一轮预热取代旧的
+		s.prewarmCancel() // 新一轮预热取代旧的（debounce 重新计时）
 	}
 	s.prewarmCancel = cancel
 	s.prewarmMu.Unlock()
 
+	// debounce 静默期：浏览还在继续（新 PROPFIND）则本预热被取消，零网关请求
+	select {
+	case <-time.After(2500 * time.Millisecond):
+	case <-ctx.Done():
+		return
+	}
+
 	for i, p := range files {
 		if ctx.Err() != nil {
 			return // 真实请求已到，让路
+		}
+		// 账号被网关限流时跳过预热：预热 302 请求会加重限流（本次限流的触发根源之一）
+		if d := s.dav.CooldownRemaining(); d > 0 {
+			vlog("prewarm skipped: gateway cooldown %ds remaining", int(d.Seconds()))
+			return
 		}
 		if i > 0 {
 			select {
